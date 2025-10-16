@@ -1,22 +1,37 @@
 package com.example.studentinternship.Controller;
 
+import com.example.studentinternship.Entity.StudentEntity;
+import com.example.studentinternship.Entity.UserEntity;
+import com.example.studentinternship.Repository.StudentRepository;
+import com.example.studentinternship.Repository.UserRepository;
 import com.example.studentinternship.Service.AuthService;
-import org.springframework.beans.factory.annotation.Autowired;
+
 import org.springframework.http.*;
+import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.util.MultiValueMap;
 import org.springframework.web.bind.annotation.*;
-import org.springframework.web.client.HttpClientErrorException;
 import org.springframework.web.client.RestTemplate;
+
 import java.util.*;
 
 @RestController
 @RequestMapping("/api/auth")
 public class AuthController {
 
-    @Autowired
-    private AuthService authService;
+    private final AuthService authService;
+    private final UserRepository userRepository;
+    private final StudentRepository studentRepository;
 
+    public AuthController(AuthService authService,
+                          UserRepository userRepository,
+                          StudentRepository studentRepository) {
+        this.authService = authService;
+        this.userRepository = userRepository;
+        this.studentRepository = studentRepository;
+    }
+
+    // -------------------- REGISTER --------------------
     @PostMapping("/register")
     public ResponseEntity<String> registerUser(@RequestBody Map<String, String> user) {
         System.out.println("[AuthController] Received register request: " + user);
@@ -24,14 +39,12 @@ public class AuthController {
         String token = authService.getAdminAccessToken();
         System.out.println("[AuthController] Admin Token retrieved successfully.");
 
-        String url = "http://localhost:8180/admin/realms/internship-portal-realm/users"; // ✅ Correct admin endpoint
+        String url = "http://localhost:8180/admin/realms/internship-portal-realm/users";
         RestTemplate restTemplate = new RestTemplate();
         HttpHeaders headers = new HttpHeaders();
-
         headers.setBearerAuth(token);
         headers.setContentType(MediaType.APPLICATION_JSON);
 
-        // ✅ Build user payload properly
         Map<String, Object> newUser = new HashMap<>();
         newUser.put("username", user.get("username"));
         newUser.put("email", user.get("email"));
@@ -39,24 +52,27 @@ public class AuthController {
         newUser.put("lastName", user.get("lastName"));
         newUser.put("enabled", true);
 
-        // ✅ Proper credentials map
         Map<String, Object> credentials = new HashMap<>();
         credentials.put("type", "password");
         credentials.put("value", user.get("password"));
-        credentials.put("temporary", "false"); // ✅ boolean value
+        credentials.put("temporary", false);
 
         newUser.put("credentials", List.of(credentials));
-
-        System.out.println("[AuthController] Sending new user data: " + newUser);
 
         try {
             HttpEntity<Map<String, Object>> request = new HttpEntity<>(newUser, headers);
             ResponseEntity<String> response = restTemplate.postForEntity(url, request, String.class);
 
-            System.out.println("[AuthController] Keycloak Response: " + response.getStatusCode() + " " + response.getBody());
-
             if (response.getStatusCode() == HttpStatus.CREATED) {
-                return ResponseEntity.ok("User created successfully!");
+                // ✅ Save to local DB
+                UserEntity newDbUser = new UserEntity();
+                newDbUser.setEmail(user.get("email"));
+                newDbUser.setUsername(user.get("username"));
+                newDbUser.setRole("student");
+                newDbUser.setEnabled(true);// ✅ automatically assign student role
+                userRepository.save(newDbUser);
+
+                return ResponseEntity.ok("User created successfully with role 'student'!");
             } else {
                 return ResponseEntity.status(response.getStatusCode())
                         .body("Failed to create user: " + response.getBody());
@@ -71,9 +87,11 @@ public class AuthController {
     }
 
 
+    // -------------------- LOGIN --------------------
     @PostMapping("/login")
-    public ResponseEntity<?> loginUser(@RequestBody Map<String, String> user) {
-        System.out.println("[AuthController] Login request received for username: " + user.get("username"));
+    public ResponseEntity<?> loginUser(@RequestBody Map<String, String> body) {
+        String username = body.get("username");
+        String password = body.get("password");
 
         try {
             RestTemplate restTemplate = new RestTemplate();
@@ -84,26 +102,40 @@ public class AuthController {
             formData.add("grant_type", "password");
             formData.add("client_id", "internship-backend-client");
             formData.add("client_secret", "LgtaAuPxzfoTrkTPzuDVR8XltXo74AuE");
-            formData.add("username", user.get("username"));
-            formData.add("password", user.get("password"));
+            formData.add("username", username);
+            formData.add("password", password);
 
-            System.out.println("[AuthController] Sending login request to Keycloak with body: " + formData);
-
-            HttpEntity<MultiValueMap<String, String>> request = new HttpEntity<>(formData, headers);
-            ResponseEntity<Map> response = restTemplate.exchange(
+            ResponseEntity<Map> response = restTemplate.postForEntity(
                     "http://localhost:8180/realms/internship-portal-realm/protocol/openid-connect/token",
-                    HttpMethod.POST,
-                    request,
+                    new HttpEntity<>(formData, headers),
                     Map.class
             );
 
-            System.out.println("[AuthController] Keycloak Response Status: " + response.getStatusCode());
-            System.out.println("[AuthController] Keycloak Response Body: " + response.getBody());
-
             return ResponseEntity.ok(response.getBody());
-        } catch (HttpClientErrorException e) {
-            System.err.println("[AuthController] Keycloak Error Response: " + e.getResponseBodyAsString());
-            return ResponseEntity.status(e.getStatusCode()).body(e.getResponseBodyAsString());
+
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body("Invalid credentials");
         }
     }
+
+    @PutMapping("/role/update")
+    @PreAuthorize("hasAuthority('admin')")
+    public ResponseEntity<?> updateUserRole(@RequestBody Map<String, String> request) {
+        String email = request.get("email");
+        String newRole = request.get("role");
+
+        if (email == null || newRole == null) {
+            return ResponseEntity.badRequest().body("Email and role are required");
+        }
+
+        return userRepository.findByEmail(email)
+                .map(user -> {
+                    user.setRole(newRole);
+                    userRepository.save(user);
+                    return ResponseEntity.ok("Role updated successfully for " + email + " to " + newRole);
+                })
+                .orElseGet(() -> ResponseEntity.status(HttpStatus.NOT_FOUND)
+                        .body("User not found with email: " + email));
+    }
+
 }
